@@ -1,0 +1,9 @@
+{
+  "name": "ccs-demo",
+  "private": true,
+  "type": "module",
+  "description": "錄製 ccs demo 影片：node record.mjs",
+  "devDependencies": {
+    "playwright-core": "1.48.2"
+  }
+}

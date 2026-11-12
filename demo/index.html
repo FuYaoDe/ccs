@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>ccs demo</title>
+<style>
+  :root {
+    --fs: 20px; --lh: 26px; --cw: 12px;
+    --bg: #1e1e2e; --text: #cdd6f4; --dim: #7f849c;
+    --cyan: #89dceb; --yellow: #f9e2af; --red: #f38ba8; --green: #a6e3a1;
+    --magenta: #cba6f7; --blue: #89b4fa;
+  }
+  html, body { margin: 0; height: 100%; background: #0b0b12; overflow: hidden; }
+  #stage {
+    position: relative; width: 1920px; height: 1080px; overflow: hidden;
+    background:
+      radial-gradient(1200px 800px at 15% 10%, #5b3f9a 0%, transparent 60%),
+      radial-gradient(1000px 700px at 90% 95%, #1f6f78 0%, transparent 60%),
+      linear-gradient(135deg, #2a2350 0%, #1b2a4a 50%, #163b44 100%);
+  }
+  #cam { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; transform-origin: 0 0; }
+  #win {
+    position: absolute; border-radius: 14px; background: var(--bg); overflow: hidden;
+    box-shadow: 0 40px 90px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.08);
+  }
+  #titlebar {
+    height: 40px; position: relative; display: flex; align-items: center; padding: 0 16px;
+    background: #181825; border-bottom: 1px solid rgba(255,255,255,.05);
+    font: 500 14px -apple-system, "SF Pro Text", "PingFang TC", sans-serif; color: #9399b2;
+  }
+  #titlebar .dots { display: flex; gap: 8px; }
+  #titlebar .dots i { width: 13px; height: 13px; border-radius: 50%; display: block; }
+  #titlebar .title { position: absolute; left: 0; right: 0; text-align: center; pointer-events: none; }
+  #term {
+    position: relative; padding: 14px 18px 16px;
+    font-size: var(--fs); line-height: var(--lh);
+    font-family: "JetBrainsMono Nerd Font", "JetBrainsMono NF", "JetBrains Mono", Menlo, "PingFang TC", monospace;
+    color: var(--text);
+  }
+  .row { display: flex; height: var(--lh); white-space: pre; }
+  .run { display: flex; flex: none; --fg: var(--text); color: var(--fg); }
+  .c { flex: none; width: var(--cw); height: var(--lh); text-align: center; }
+  .w2 { width: calc(var(--cw) * 2); font-size: calc(var(--fs) * 1.1); }
+  .s-dim, .s-quote, .s-mark { --fg: var(--dim); }
+  .s-title, .s-bold, .s-th { font-weight: 700; }
+  .s-proj, .s-sh_path { --fg: var(--cyan); }
+  .s-sh_path { font-weight: 700; }
+  .s-missing { --fg: var(--red); font-weight: 700; }
+  .s-branch { --fg: var(--yellow); }
+  .s-prompt { --fg: var(--yellow); font-weight: 700; }
+  .s-h { --fg: var(--magenta); font-weight: 700; }
+  .s-code { --fg: var(--green); }
+  .s-link { --fg: var(--blue); text-decoration: underline; }
+  .s-sh_glyph { --fg: var(--magenta); }
+  .s-ok { --fg: var(--green); font-weight: 700; }
+  .rev { background: var(--fg); color: var(--bg); }
+  /* 方框字元用線條畫，才會上下左右接得起來 */
+  .bx-v { background: linear-gradient(var(--fg), var(--fg)) center / 1.5px 100% no-repeat; }
+  .bx-h { background: linear-gradient(var(--fg), var(--fg)) center / 100% 1.5px no-repeat; }
+  .bx-x { background: linear-gradient(var(--fg), var(--fg)) center / 1.5px 100% no-repeat,
+                      linear-gradient(var(--fg), var(--fg)) center / 100% 1.5px no-repeat; }
+  #cursor { position: absolute; width: var(--cw); height: var(--lh); background: #f5e0dc; mix-blend-mode: difference; }
+
+  #keys {
+    position: absolute; left: 50%; bottom: 64px; transform: translateX(-50%);
+    padding: 12px 26px; border-radius: 16px; white-space: nowrap;
+    background: rgba(17, 17, 27, .82); border: 1px solid rgba(255,255,255,.14);
+    box-shadow: 0 12px 30px rgba(0,0,0,.35);
+    font: 600 32px -apple-system, "SF Pro Display", "PingFang TC", sans-serif; color: #fff;
+    opacity: 0;
+  }
+  #endcard {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(10, 10, 20, .55); backdrop-filter: blur(10px); opacity: 0;
+  }
+  #endcard .box { text-align: center; color: #fff; font-family: -apple-system, "PingFang TC", sans-serif; }
+  #endcard .logo { font: 800 140px "JetBrainsMono Nerd Font", "JetBrains Mono", Menlo, monospace; letter-spacing: -4px; }
+  #endcard .logo b { color: var(--magenta); }
+  #endcard .sub { font-size: 38px; font-weight: 600; margin-top: 8px; }
+  #endcard .url { font: 500 30px "JetBrainsMono Nerd Font", Menlo, monospace; color: var(--cyan); margin-top: 28px; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="cam">
+    <div id="win">
+      <div id="titlebar">
+        <div class="dots"><i style="background:#ff5f57"></i><i style="background:#febc2e"></i><i style="background:#28c840"></i></div>
+        <div class="title">~/Projects/my-app — ccs</div>
+      </div>
+      <div id="term"><div id="screen"></div><div id="cursor"></div></div>
+    </div>
+  </div>
+  <div id="keys"></div>
+  <div id="endcard"><div class="box">
+    <div class="logo"><b>❯</b> ccs</div>
+    <div class="sub">跨專案瀏覽 Claude Code sessions，一鍵複製 resume 指令</div>
+    <div class="url">github.com/FuYaoDe/ccs</div>
+  </div></div>
+</div>
+<script src="timeline.js"></script>
+<script>
+const T = window.TIMELINE;
+const STAGE_W = 1920, STAGE_H = 1080;
+const $ = (id) => document.getElementById(id);
+const screenEl = $("screen"), cursorEl = $("cursor"), camEl = $("cam"), winEl = $("win");
+const keysEl = $("keys"), endEl = $("endcard");
+let CW = 12, LH = 26, geo = null;
+
+const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const BOX = { "│": "bx-v", "─": "bx-h", "┼": "bx-x" };
+
+function attrClasses(attr) {
+  const cls = [];
+  T.styles.forEach((name, i) => { if (attr & (1 << i)) cls.push("s-" + name); });
+  if (attr & T.reverse) cls.push("rev");
+  return cls.join(" ");
+}
+
+const htmlCache = new Map();
+function stateHTML(idx) {
+  if (htmlCache.has(idx)) return htmlCache.get(idx);
+  const rows = T.states[idx].rows.map((runs) => {
+    let out = '<div class="row">';
+    for (const [attr, text, mask] of runs) {
+      out += `<span class="run ${attrClasses(attr)}">`;
+      [...text].forEach((ch, i) => {
+        const box = BOX[ch];
+        out += `<span class="c${mask[i] === "2" ? " w2" : ""}${box ? " " + box : ""}">${box ? "" : esc(ch)}</span>`;
+      });
+      out += "</span>";
+    }
+    return out + "</div>";
+  });
+  const html = rows.join("");
+  htmlCache.set(idx, html);
+  return html;
+}
+
+function layout() {
+  const probe = document.createElement("span");
+  probe.className = "c"; probe.style.width = "auto"; probe.textContent = "M".repeat(100);
+  screenEl.appendChild(probe);
+  CW = probe.getBoundingClientRect().width / 100;
+  probe.remove();
+  document.documentElement.style.setProperty("--cw", CW + "px");
+  LH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--lh"));
+  const termW = T.cols * CW + 36, winH = 40 + 14 + T.rows * LH + 16;
+  const left = Math.round((STAGE_W - termW) / 2), top = Math.round((STAGE_H - winH) / 2);
+  Object.assign(winEl.style, { left: left + "px", top: top + "px", width: termW + "px", height: winH + "px" });
+  geo = { left, top, w: termW, h: winH, termX: left + 18, termY: top + 40 + 14 };
+}
+
+// ---------- 鏡頭 ----------
+const ease = (x) => (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2);
+
+function target(kf) {
+  const s = kf.scale;
+  let cx, cy;
+  if (kf.col == null) { cx = geo.left + geo.w / 2; cy = geo.top + geo.h / 2; }
+  else { cx = geo.termX + (kf.col + 0.5) * CW; cy = geo.termY + (kf.row + 0.5) * LH; }
+  // 鏡頭不要露出太多視窗外面的背景
+  const m = 56, vw = STAGE_W / s, vh = STAGE_H / s;
+  const clamp = (v, lo, hi) => (lo > hi ? (lo + hi) / 2 : Math.min(Math.max(v, lo), hi));
+  cx = clamp(cx, geo.left - m + vw / 2, geo.left + geo.w + m - vw / 2);
+  cy = clamp(cy, geo.top - m + vh / 2, geo.top + geo.h + m - vh / 2);
+  return { cx, cy, s };
+}
+
+function cameraAt(t) {
+  let cur = target(T.camera[0]);
+  for (const kf of T.camera) {
+    const to = target(kf);
+    if (t >= kf.t1) { cur = to; continue; }
+    if (t > kf.t0) {
+      const k = ease((t - kf.t0) / (kf.t1 - kf.t0));
+      cur = { cx: cur.cx + (to.cx - cur.cx) * k, cy: cur.cy + (to.cy - cur.cy) * k,
+              s: Math.exp(Math.log(cur.s) + (Math.log(to.s) - Math.log(cur.s)) * k) };
+    }
+    break;
+  }
+  return cur;
+}
+
+// ---------- 繪製某個時間點 ----------
+let shownState = -1;
+function renderAt(t) {
+  let ev = T.events[0], idx = 0;
+  for (let i = 0; i < T.events.length; i++) { if (T.events[i].t <= t) { ev = T.events[i]; idx = i; } }
+  if (ev.state !== shownState) { screenEl.innerHTML = stateHTML(ev.state); shownState = ev.state; }
+
+  const cur = T.states[ev.state].cursor;
+  const blinkOn = t - ev.t < 0.6 || Math.floor((t - ev.t) / 0.55) % 2 === 0;
+  if (cur && blinkOn && t < T.endcard) {
+    cursorEl.style.display = "block";
+    cursorEl.style.left = 18 + cur[1] * CW + "px";
+    cursorEl.style.top = 14 + cur[0] * LH + "px";
+  } else cursorEl.style.display = "none";
+
+  const c = cameraAt(t);
+  camEl.style.transform = `translate(${STAGE_W / 2 - c.cx * c.s}px, ${STAGE_H / 2 - c.cy * c.s}px) scale(${c.s})`;
+
+  // 按鍵提示：每次按鍵亮 1.1 秒
+  let key = null;
+  for (let i = idx; i >= 0; i--) { if (T.events[i].key) { key = T.events[i]; break; } }
+  let op = 0, sc = 1;
+  if (key && t < T.endcard) {
+    const dt = t - key.t;
+    if (dt >= 0 && dt < 1.1) {
+      op = dt < 0.12 ? dt / 0.12 : dt > 0.85 ? 1 - (dt - 0.85) / 0.25 : 1;
+      sc = dt < 0.12 ? 0.9 + 0.1 * (dt / 0.12) : 1;
+    }
+    keysEl.textContent = key.key;
+  }
+  keysEl.style.opacity = op;
+  keysEl.style.transform = `translateX(-50%) scale(${sc})`;
+
+  endEl.style.opacity = Math.max(0, Math.min(1, (t - T.endcard) / 0.8));
+}
+
+window.DURATION = T.duration;
+window.renderAt = renderAt;
+window.READY = document.fonts.ready.then(() => { layout(); renderAt(0); return true; });
+
+// 直接用瀏覽器打開時：即時播放（錄影時加 ?record 就不會自己播）
+if (!location.search.includes("record")) {
+  window.READY.then(() => {
+    const start = performance.now();
+    const tick = () => { renderAt(((performance.now() - start) / 1000) % (T.duration + 1)); requestAnimationFrame(tick); };
+    requestAnimationFrame(tick);
+  });
+}
+</script>
+</body>
+</html>

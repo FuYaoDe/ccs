@@ -4,20 +4,9 @@
 
 Claude Code 依「開啟時的目錄」分開存放 session，`claude --resume` 只列得出目前目錄的 session。專案和 worktree 一多，常常想不起某段對話是在哪個目錄開的。`ccs` 把所有專案的 session 集中在一個 TUI 裡：用方向鍵挑選、打字搜尋，右邊預覽對話內容。按 Enter 就會把 `cd <目錄> && claude -r <session id>` 複製到剪貼簿。
 
-```
-❯ 登入                                                                       3/128
-↑↓ 選擇 · Shift↑↓／滾輪 捲動預覽 · 打字搜尋 · Enter 複製指令 · Ctrl-O 直接開啟 · Esc 離開
-▶ 11-13 14:20  my-app          登入頁改版             │ 11-13 14:20  my-app 登入頁改版
-  11-12 09:41  api ⎇ fix-auth  登入 token 過期問題    │
-  11-02 18:05  ✗ old-web       舊版登入流程整理       │ › 登入按鈕在手機上會被鍵盤擋住，幫我修
-                                                      │   改好了，原因是表單高度用了 100vh：
-                                                      │   • 改用 dvh，鍵盤彈出時高度會跟著變
-                                                      │   • 補上 iOS Safari 的測試
-                                                      │
-                                                      │ › 順便把錯誤訊息改成中文
-                                                      │   已改成中文，訊息集中在 i18n/zh-TW.json。
-                                                      │ ▲  第 4–5 輪，共 5 輪 · Shift↑↓／滾輪 捲動
-```
+[![ccs demo：搜尋、預覽對話、複製 resume 指令](demo/ccs-demo.gif)](demo/ccs-demo-web.mp4)
+
+點上面的動畫可以看 1080p 的 MP4 版本。影片裡的 session 全部是虛構資料，錄製方式在 [`demo/`](demo/)。
 
 ## 功能
 
