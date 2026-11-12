@@ -6,7 +6,7 @@ Claude Code 依「開啟時的目錄」分開存放 session，`claude --resume` 
 
 [![ccs demo：搜尋、預覽對話、複製 resume 指令](demo/ccs-demo.gif)](demo/ccs-demo-web.mp4)
 
-點上面的動畫可以看 1080p 的 MP4 版本。影片裡的 session 全部是虛構資料，錄製方式在 [`demo/`](demo/)。
+點上面的動畫可以下載 1080p 的 MP4 版本。影片裡的 session 全部是虛構資料，錄製方式在 [`demo/`](demo/)。
 
 ## 功能
 
