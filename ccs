@@ -1,0 +1,1033 @@
+#!/usr/bin/env python3
+"""ccs — 跨專案瀏覽 Claude Code sessions，一鍵複製 resume 指令。
+
+用法：
+  ccs [關鍵字...]          開啟 TUI 挑選 session
+  ccs --print [關鍵字...]  選好後只把 resume 指令印到 stdout（不複製）
+  ccs | grep 關鍵字         輸出不是終端機時，改成純文字列出
+
+TUI 按鍵：
+  ↑ ↓（或 Ctrl-P / Ctrl-N）  選擇 session      Home / End  第一筆 / 最後一筆
+  Shift-↑ / Shift-↓、滾輪     捲動預覽（往上可以一路看到第一輪對話）
+  PgUp / PgDn、Ctrl-B / F     預覽整頁翻
+  滑鼠點一下                  選擇 session（反白選字：Ghostty 按住 Shift、iTerm2 按住 Option 再拖曳）
+  直接打字                    搜尋（空白分隔多個關鍵字）
+  Backspace / Ctrl-U          刪一個字 / 清空搜尋
+  Enter                       複製 resume 指令並離開
+  Ctrl-O                      直接在該目錄開啟 session
+  Esc / Ctrl-C                離開
+
+資料來源是 ~/.claude/projects/*/*.jsonl（Claude Code 自己存的對話紀錄），
+列表用的摘要會快取在 ~/.cache/ccs/index.json，只重新解析有變動的檔案。
+"""
+import bisect
+import json
+import locale
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import unicodedata
+from datetime import datetime
+from pathlib import Path
+
+PROMPT_MAX = 100     # 預覽中每則 prompt 超過這個字數就截斷成 ...
+REPLY_MAX = 300      # 預覽中每段 AI 回覆（不算 markdown 符號）超過這個字數就截斷成 ...
+TURNS_SHOWN = 3      # 預覽一開始停在最近幾輪（往上捲可以看更早的）
+SCROLL_STEP = 3      # Shift-↑↓ / 滾輪一次捲幾行
+
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
+CACHE_FILE = Path.home() / ".cache" / "ccs" / "index.json"
+CACHE_VERSION = 2
+HOME = str(Path.home())
+PROJECTS_ROOT = os.path.join(HOME, "Projects")
+
+# 這些開頭的 user 訊息不是你打的字（背景任務通知、指令輸出、系統注入）
+SKIP_PREFIXES = (
+    "<task-notification>", "<bash-stdout>", "<bash-stderr>",
+    "<local-command-stdout>", "<local-command-stderr>", "<local-command-caveat>",
+    "<system-reminder>", "[Request interrupted", "Caveat:",
+)
+TS_RE = re.compile(rb'"timestamp":"([^"]+)"')
+MARKERS = ('"type":"user"', '"type":"custom-title"', '"type":"ai-title"', '"type":"summary"')
+
+# 終端機輸出（非 TUI）用的顏色
+ANSI = {"dim": "\033[2m", "proj": "\033[36m", "missing": "\033[31m", "branch": "\033[33m",
+        "title": "\033[1m", "prompt": "\033[1;33m", "ok": "\033[32m", "warn": "\033[33m",
+        "h": "\033[1;35m", "bold": "\033[1m", "th": "\033[1m", "code": "\033[32m",
+        "link": "\033[4;34m", "quote": "\033[2m", "mark": "\033[2m"}
+RESET = "\033[0m"
+
+
+# ---------- 解析 session 檔 ----------
+
+def iter_records(path, with_assistant=False):
+    """逐行讀 jsonl，只解析需要的紀錄；工具結果（通常很大）直接跳過。"""
+    markers = MARKERS + (('"type":"assistant"',) if with_assistant else ())
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if '"type":"user"' in line and '"tool_result"' in line:
+                continue
+            if not any(m in line for m in markers):
+                continue
+            try:
+                yield json.loads(line)
+            except ValueError:
+                continue
+
+
+def prompt_text(rec):
+    """回傳你實際輸入的內容；工具結果與系統注入的訊息回傳 None。"""
+    if rec.get("type") != "user" or rec.get("isSidechain") or rec.get("isMeta") \
+            or rec.get("isCompactSummary"):
+        return None
+    content = (rec.get("message") or {}).get("content")
+    if isinstance(content, str):
+        s = content.strip()
+        if s.startswith(SKIP_PREFIXES):
+            return None
+        m = re.search(r"<command-name>(.*?)</command-name>", s, re.S)
+        if m:
+            args = re.search(r"<command-args>(.*?)</command-args>", s, re.S)
+            return (m.group(1).strip() + " " + (args.group(1).strip() if args else "")).strip()
+        m = re.search(r"<bash-input>(.*?)</bash-input>", s, re.S)
+        if m:
+            return "! " + m.group(1).strip()
+        return s or None
+    if isinstance(content, list):
+        texts, images = [], 0
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            kind = block.get("type")
+            if kind == "tool_result":
+                return None
+            if kind == "text":
+                t = (block.get("text") or "").strip()
+                if t and not t.startswith(SKIP_PREFIXES):
+                    texts.append(t)
+            elif kind == "image":
+                images += 1
+        s = " ".join(texts)
+        if images:
+            s = (s + " [圖片×%d]" % images).strip()
+        return s or None
+    return None
+
+
+def reply_text(rec):
+    """回傳 assistant 紀錄裡的文字內容（忽略 thinking / tool_use）。"""
+    if rec.get("type") != "assistant" or rec.get("isSidechain"):
+        return None
+    msg = rec.get("message") or {}
+    if msg.get("model") == "<synthetic>":
+        return None
+    parts = [b.get("text") or "" for b in msg.get("content") or []
+             if isinstance(b, dict) and b.get("type") == "text"]
+    s = "\n".join(p for p in parts if p.strip()).strip()
+    return s or None
+
+
+def parse_ts(ts):
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except (ValueError, AttributeError):
+        return None
+
+
+def last_activity(path):
+    """檔尾最後一個時間戳。不用檔案修改時間，因為 Claude Code 會在舊 session
+    檔尾補寫沒有時間戳的 metadata，讓修改時間失真。"""
+    try:
+        with open(path, "rb") as f:
+            size = f.seek(0, 2)
+            for chunk in (512 * 1024, 16 * 1024 * 1024):
+                f.seek(max(0, size - chunk))
+                found = TS_RE.findall(f.read())
+                if found:
+                    return parse_ts(found[-1].decode())
+                if chunk >= size:
+                    break
+    except OSError:
+        pass
+    return None
+
+
+def build_meta(path):
+    meta = {"cwd": None, "branch": None, "title": None, "ai_title": None, "summary": None,
+            "first_prompt": None, "last_prompt": None, "n_prompts": 0}
+    for rec in iter_records(path):
+        t = rec.get("type")
+        if t == "custom-title":
+            meta["title"] = rec.get("customTitle") or meta["title"]
+        elif t == "ai-title":
+            meta["ai_title"] = rec.get("aiTitle") or meta["ai_title"]
+        elif t == "summary":
+            meta["summary"] = rec.get("summary") or meta["summary"]
+        elif t == "user" and not rec.get("isSidechain"):
+            # resume 必須在 session 一開始的目錄執行，所以取第一個 cwd
+            if not meta["cwd"] and rec.get("cwd"):
+                meta["cwd"] = rec["cwd"]
+            if rec.get("gitBranch"):
+                meta["branch"] = rec["gitBranch"]
+            p = prompt_text(rec)
+            if p:
+                meta["n_prompts"] += 1
+                if meta["first_prompt"] is None:
+                    meta["first_prompt"] = p[:300]
+                meta["last_prompt"] = p[:300]
+    meta["last"] = last_activity(path)
+    return meta
+
+
+def load_sessions():
+    try:
+        data = json.loads(CACHE_FILE.read_text())
+        cache = data["files"] if data.get("v") == CACHE_VERSION else {}
+    except (OSError, ValueError, KeyError):
+        cache = {}
+
+    new_cache, sessions, dirty = {}, [], False
+    for p in PROJECTS_DIR.glob("*/*.jsonl"):
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        key = str(p)
+        hit = cache.get(key)
+        if hit and hit["m"] == st.st_mtime_ns and hit["s"] == st.st_size:
+            meta = hit["meta"]
+        else:
+            meta, dirty = build_meta(p), True
+        new_cache[key] = {"m": st.st_mtime_ns, "s": st.st_size, "meta": meta}
+        if meta["cwd"] and meta["n_prompts"]:
+            s = dict(meta, id=p.stem, path=key, last=meta["last"] or st.st_mtime,
+                     exists=os.path.isdir(meta["cwd"]))
+            s["_hay"] = " ".join([title_of(s), project_label(s["cwd"]), s["cwd"], s["branch"] or "",
+                                  s["last_prompt"] or "", s["first_prompt"] or ""]).lower()
+            sessions.append(s)
+
+    if dirty or len(new_cache) != len(cache):
+        try:
+            CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = CACHE_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"v": CACHE_VERSION, "files": new_cache}, ensure_ascii=False))
+            os.replace(tmp, CACHE_FILE)
+        except OSError:
+            pass
+
+    sessions.sort(key=lambda s: s["last"], reverse=True)
+    return sessions
+
+
+def preview_data(path):
+    """最近幾輪對話：每輪是 [prompt, 該輪 AI 最後一段文字]。"""
+    path = Path(path)
+    turns = []
+    cwd = title = ai_title = None
+    for rec in iter_records(path, with_assistant=True):
+        t = rec.get("type")
+        if t == "custom-title":
+            title = rec.get("customTitle") or title
+        elif t == "ai-title":
+            ai_title = rec.get("aiTitle") or ai_title
+        elif t == "user" and not rec.get("isSidechain"):
+            cwd = cwd or rec.get("cwd")
+            p = prompt_text(rec)
+            if p:
+                turns.append([p, None])
+        elif t == "assistant" and turns:
+            r = reply_text(rec)
+            if r:
+                # 同一輪有多段文字時保留最後一段，通常就是給你的結論
+                turns[-1][1] = r
+    cwd = cwd or "?"
+    return {
+        "when": datetime.fromtimestamp(last_activity(path) or path.stat().st_mtime).strftime("%m-%d %H:%M"),
+        "cwd": cwd,
+        "exists": os.path.isdir(cwd),
+        "name": oneline(title or ai_title or (turns[0][0] if turns else "(無標題)")),
+        # 全部的輪次都留著給捲動用；先截短，顯示時還會再依 PROMPT_MAX / REPLY_MAX 截
+        "turns": [[p[:500], r[:4000] if r else None] for p, r in turns],
+    }
+
+
+# ---------- 文字處理 ----------
+
+def char_width(ch):
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+
+
+def text_width(s):
+    return sum(char_width(c) for c in s)
+
+
+def cut(s, width):
+    """依顯示寬度截斷（中文字算 2 格）。"""
+    out, w = [], 0
+    for c in s:
+        cw = char_width(c)
+        if w + cw > width:
+            break
+        out.append(c)
+        w += cw
+    return "".join(out)
+
+
+def fit(s, width):
+    """截斷並補空白到固定寬度，過長時結尾放 …。"""
+    if text_width(s) <= width:
+        return s + " " * (width - text_width(s))
+    t = cut(s, width - 1) + "…"
+    return t + " " * (width - text_width(t))
+
+
+def sanitize(s):
+    s = (s or "").replace("\t", "    ")
+    return "".join(c for c in s if c == "\n" or unicodedata.category(c) not in ("Cc", "Cf"))
+
+
+def oneline(s):
+    return re.sub(r"\s+", " ", sanitize(s)).strip()
+
+
+def clip(s, n):
+    return s if len(s) <= n else s[:n] + "..."
+
+
+def is_word_char(ch):
+    return ch.isascii() and (ch.isalnum() or ch in "_-.'/:#@")
+
+
+def group_cells(cells):
+    segs = []
+    for ch, st in cells:
+        if segs and segs[-1][1] == st:
+            segs[-1] = (segs[-1][0] + ch, st)
+        else:
+            segs.append((ch, st))
+    return segs
+
+
+def wrap_segs(segs, width, indent=0):
+    """依顯示寬度換行，英文單字不拆開，續行縮排 indent 格。回傳每行的 [(文字, 樣式)]。"""
+    width = max(width, indent + 4)
+    lines, cur, w = [], [], 0
+    for text, st in segs:
+        for ch in text:
+            cw = char_width(ch)
+            if w + cw > width and cur:
+                rest = []
+                if is_word_char(ch):
+                    k = len(cur) - 1
+                    while k >= 0 and is_word_char(cur[k][0]):
+                        k -= 1
+                    if 0 < len(cur) - 1 - k < 20 and k >= indent:
+                        rest = cur[k + 1:]
+                        cur = cur[:k] if cur[k][0] == " " else cur[:k + 1]
+                lines.append(cur)
+                cur = [(" ", None)] * indent + rest
+                w = indent + sum(char_width(c) for c, _ in rest)
+                if ch == " ":
+                    continue
+            cur.append((ch, st))
+            w += cw
+    lines.append(cur)
+    return [group_cells(line) for line in lines]
+
+
+# ---------- Markdown（AI 回覆）----------
+
+INLINE_RE = re.compile(
+    r"\*\*(?P<bold>.+?)\*\*"
+    r"|`(?P<code>[^`]+)`"
+    r"|\[(?P<link>[^\]]+)\]\([^)\s]+\)"
+    r"|(?<![\w*])\*(?P<em>[^*\s](?:[^*]*[^*\s])?)\*(?![\w*])"
+)
+TABLE_SEP_RE = re.compile(r":?-{2,}:?")
+
+
+def inline_md(text, base):
+    """行內 markdown：**粗體**、`程式碼`、[連結](url)、*斜體*。回傳 [(文字, 樣式)]。"""
+    segs, pos = [], 0
+    for m in INLINE_RE.finditer(text):
+        if m.start() > pos:
+            segs.append((text[pos:m.start()], base))
+        if m.group("bold") is not None:
+            segs += inline_md(m.group("bold"), "bold" if base == "reply" else base)
+        elif m.group("code") is not None:
+            segs.append((m.group("code"), "code"))
+        elif m.group("link") is not None:
+            segs.append((m.group("link"), "link"))
+        else:
+            segs.append((m.group("em"), base))
+        pos = m.end()
+    if pos < len(text):
+        segs.append((text[pos:], base))
+    return segs
+
+
+def md_blocks(text):
+    """把 markdown 拆成區塊：標題、段落、清單、引用、程式碼、表格列、分隔線。"""
+    blocks, in_code = [], False
+    for raw in text.split("\n"):
+        line = raw.rstrip()
+        s = line.strip()
+        if s.startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code:
+            blocks.append(("code", line))
+            continue
+        if not s:
+            continue
+        m = re.match(r"#{1,6}\s+(.*)", s)
+        if m:
+            blocks.append(("h", m.group(1).rstrip("# ")))
+            continue
+        if re.fullmatch(r"-{3,}|\*{3,}|_{3,}", s):
+            blocks.append(("rule",))
+            continue
+        if s.startswith("|") and s.count("|") >= 2:
+            cells = [c.strip() for c in s.strip("|").split("|")]
+            is_sep = any(cells) and all(TABLE_SEP_RE.fullmatch(c) for c in cells if c)
+            if is_sep and blocks and blocks[-1][0] == "row":
+                blocks[-1] = ("row", blocks[-1][1], True)      # 上一列是表頭
+            elif not is_sep:
+                blocks.append(("row", cells, False))
+            continue
+        m = re.match(r"(\s*)(?:[-*+]|(\d+)[.)])\s+(.*)", line)
+        if m:
+            bullet = (m.group(2) + ". ") if m.group(2) else "• "
+            blocks.append(("li", "  " * (len(m.group(1)) // 2) + bullet, m.group(3)))
+            continue
+        if s.startswith(">"):
+            blocks.append(("quote", s.lstrip(">").strip()))
+            continue
+        blocks.append(("p", s))
+    return blocks
+
+
+def take(segs, budget):
+    """從 segs 取最多 budget 個字。回傳 (取到的 segs, 用掉的字數, 是否被截斷)。"""
+    out, used = [], 0
+    for text, st in segs:
+        if used + len(text) > budget:
+            out.append((text[:budget - used], st))
+            return out, budget, True
+        out.append((text, st))
+        used += len(text)
+    return out, used, False
+
+
+def reply_items(text, budget):
+    """AI 回覆轉成版面項目；看得到的字數超過 budget 就截斷並在最後加 ...。"""
+    items, left = [], budget
+    blocks = md_blocks(text)
+    for i, b in enumerate(blocks):
+        kind, cut = b[0], False
+        if kind == "rule":
+            items.append(("rule",))
+        elif kind == "row":
+            row = []
+            for cell in b[1]:
+                segs, used, cut = take(inline_md(cell, "th" if b[2] else "reply"), left)
+                left -= used
+                row.append(segs)
+                if cut:
+                    break
+            items.append(("row", row, b[2]))
+        else:
+            if kind == "li":
+                prefix, content = [(b[1], "mark")], inline_md(b[2], "reply")
+            elif kind == "code":
+                prefix, content = [("  ", None)], [(b[1], "code")]
+            elif kind == "quote":
+                prefix, content = [("│ ", "mark")], inline_md(b[1], "quote")
+            else:
+                prefix, content = [], inline_md(b[1], "h" if kind == "h" else "reply")
+            segs, used, cut = take(content, left)
+            left -= used
+            items.append(("line", prefix, segs))
+        if cut or (left <= 0 and i < len(blocks) - 1):
+            last = items[-1]
+            if last[0] == "line":
+                last[2].append(("...", "reply"))
+            elif last[0] == "row":
+                last[1][-1].append(("...", "reply"))
+            else:
+                items.append(("line", [], [("...", "reply")]))
+            break
+    return items
+
+
+def layout_table(rows, width):
+    """表格：欄位對齊；放不下就把最寬的欄位縮窄，儲存格內換行。"""
+    ncol = max(len(r[1]) for r in rows)
+    cells = [[r[1][k] if k < len(r[1]) else [] for k in range(ncol)] for r in rows]
+    widths = [max(max(text_width("".join(t for t, _ in row[k])), 1) for row in cells)
+              for k in range(ncol)]
+    avail = width - 3 * (ncol - 1)
+    while sum(widths) > avail:
+        k = widths.index(max(widths))
+        if widths[k] <= 6:
+            break
+        widths[k] -= 1
+    if sum(widths) > avail:                          # 欄位太多實在放不下：每列各自換行
+        lines = []
+        for row in cells:
+            segs = []
+            for k, cell in enumerate(row):
+                if k:
+                    segs.append((" │ ", "mark"))
+                segs += cell
+            lines += wrap_segs(segs, width)
+        return lines
+
+    sep = [("─┼─".join("─" * w for w in widths), "mark")]
+    wrapped = [[wrap_segs(cell, widths[k]) for k, cell in enumerate(row)] for row in cells]
+    multiline = any(len(c) > 1 for row in wrapped for c in row)
+    lines = []
+    for ri, (r, row) in enumerate(zip(rows, wrapped)):
+        for li in range(max(len(c) for c in row)):
+            line = []
+            for k, cell_lines in enumerate(row):
+                if k:
+                    line.append((" │ ", "mark"))
+                segs = cell_lines[li] if li < len(cell_lines) else []
+                line += segs
+                pad = widths[k] - text_width("".join(t for t, _ in segs))
+                if pad > 0 and k < ncol - 1:
+                    line.append((" " * pad, None))
+            lines.append(line)
+        # 表頭下面一定畫線；有儲存格換行時每列之間也畫線，才分得出哪幾行是同一列
+        if r[2] or (multiline and ri < len(rows) - 1):
+            lines.append(sep)
+    return lines
+
+
+def layout_items(items, width, indent=0):
+    """把版面項目排成實際的行（換行、表格對齊），整段縮排 indent 格。"""
+    pad = [(" " * indent, None)] if indent else []
+    inner = width - indent
+    lines, i = [], 0
+    while i < len(items):
+        it = items[i]
+        if it[0] == "rule":
+            lines.append(pad + [("─" * max(1, min(inner, 40)), "mark")])
+            i += 1
+        elif it[0] == "row":
+            j = i
+            while j < len(items) and items[j][0] == "row":
+                j += 1
+            lines += [pad + ln for ln in layout_table(items[i:j], inner)]
+            i = j
+        else:
+            prefix, segs = it[1], it[2]
+            pw = text_width("".join(t for t, _ in prefix))
+            lines += [pad + ln for ln in wrap_segs(prefix + segs, inner, pw)]
+            i += 1
+    return lines
+
+
+def project_label(cwd):
+    if cwd.startswith(PROJECTS_ROOT + "/"):
+        p = cwd[len(PROJECTS_ROOT) + 1:]
+    elif cwd.startswith(HOME):
+        p = "~" + cwd[len(HOME):]
+    else:
+        p = cwd
+    return p.replace("/.claude/worktrees/", " ⎇ ")
+
+
+def branch_label(branch):
+    return "" if not branch or branch == "HEAD" else branch
+
+
+def title_of(s):
+    return oneline(s["title"] or s["ai_title"] or s["summary"] or s["first_prompt"] or "(無標題)")
+
+
+def resume_cmd(s):
+    return "cd %s && claude -r %s" % (shlex.quote(s["cwd"]), s["id"])
+
+
+def row_segments(s, width):
+    """列表的一列：時間、專案、（夠寬時）分支、標題。回傳 [(文字, 樣式)]。"""
+    when = datetime.fromtimestamp(s["last"]).strftime("%m-%d %H:%M")
+    proj_w = 24 if width >= 90 else 16
+    proj = ("" if s["exists"] else "✗ ") + project_label(s["cwd"])
+    segs = [(when + "  ", "dim"), (fit(proj, proj_w) + " ", "proj" if s["exists"] else "missing")]
+    if width >= 100:
+        segs.append((fit(branch_label(s["branch"]), 16) + " ", "branch"))
+    segs.append((title_of(s), "title"))
+    return segs
+
+
+def preview_view(d, width):
+    """預覽版面（依寬度換行）。回傳 (head, body, starts)：
+    head 是固定在上方的標題列，body 是可捲動的對話，starts[i] 是第 i 輪在 body 的起始行。
+    每一行都是 [(文字, 樣式)]。"""
+    proj = ("" if d["exists"] else "✗ ") + project_label(d["cwd"])
+    proj_style = "proj" if d["exists"] else "missing"
+    head = [(d["when"] + "  ", "dim"), (proj + " ", proj_style), (d["name"], "title")]
+    if text_width("".join(t for t, _ in head)) <= width:
+        head_lines = [head]
+    else:
+        head_lines = [head[:2]] + wrap_segs([(d["name"], "title")], width)
+    body, starts = [], []
+    if not d["turns"]:
+        body = [[], [("（沒有對話）", "dim")]]
+    for prompt, reply in d["turns"]:
+        starts.append(len(body))
+        body.append([])
+        body += wrap_segs([("› " + clip(oneline(prompt), PROMPT_MAX), "prompt")], width, 2)
+        if reply:
+            body += layout_items(reply_items(sanitize(reply).strip(), REPLY_MAX), width, indent=2)
+        else:
+            body.append([("  （沒有回覆）", "dim")])
+    return head_lines, body, starts
+
+
+def ansi_line(segs):
+    return "".join(ANSI.get(style, "") + text + RESET for text, style in segs)
+
+
+def plain_row(s):
+    when = datetime.fromtimestamp(s["last"]).strftime("%m-%d %H:%M")
+    proj = ("✗ " if not s["exists"] else "") + project_label(s["cwd"])
+    return "%s  %s  %s  %s  ›  %s" % (when, fit(proj, 28), fit(branch_label(s["branch"]), 18),
+                                      title_of(s), resume_cmd(s))
+
+
+# ---------- TUI ----------
+
+class TUI:
+    HELP = "↑↓ 選擇 · Shift↑↓／滾輪 捲動預覽 · 打字搜尋 · Enter 複製指令 · Ctrl-O 直接開啟 · Esc 離開"
+    QUIT = object()
+    MOUSE_ON = "\x1b[?1000h\x1b[?1006h"     # 開啟滑鼠回報（SGR 格式），滾輪和點擊才收得到
+    MOUSE_OFF = "\x1b[?1000l\x1b[?1006l"
+
+    def __init__(self, scr, sessions, query):
+        import curses
+        self.c = curses
+        self.scr, self.sessions, self.query = scr, sessions, query
+        self.previews = {}          # path → preview_data
+        self.views = {}             # (path, 寬度) → preview_view
+        self.sel = self.top = 0
+        self.pscroll = None         # 預覽捲動位置；None = 還沒定（停在最近幾輪）
+        self.pscroll_path = None
+        self.pbody_h = 10
+        self.list_rect = self.prev_rect = (0, 0, 0, 0)   # (y, x, 高, 寬)
+        self.apply_filter()
+        self.init_screen()
+
+    def init_screen(self):
+        c = self.c
+        c.raw()                  # 收得到 Ctrl-C / Ctrl-O（macOS 預設會把 Ctrl-O 吃掉）
+        self.scr.keypad(True)
+        try:
+            c.curs_set(1)
+        except c.error:
+            pass
+        sys.stdout.write(self.MOUSE_ON)
+        sys.stdout.flush()
+        attrs = {"dim": c.A_DIM, "title": c.A_BOLD, "reply": c.A_NORMAL,
+                 "proj": c.A_NORMAL, "missing": c.A_BOLD, "branch": c.A_NORMAL, "prompt": c.A_BOLD,
+                 "h": c.A_BOLD, "bold": c.A_BOLD, "th": c.A_BOLD, "code": c.A_NORMAL,
+                 "link": c.A_UNDERLINE, "quote": c.A_DIM, "mark": c.A_DIM}
+        if c.has_colors():
+            try:
+                c.use_default_colors()
+                bg = -1
+            except c.error:
+                bg = c.COLOR_BLACK
+            for i, (name, color) in enumerate([("proj", c.COLOR_CYAN), ("missing", c.COLOR_RED),
+                                               ("branch", c.COLOR_YELLOW), ("prompt", c.COLOR_YELLOW),
+                                               ("h", c.COLOR_MAGENTA), ("code", c.COLOR_GREEN),
+                                               ("link", c.COLOR_BLUE)], 1):
+                c.init_pair(i, color, bg)
+                attrs[name] = c.color_pair(i)
+            attrs["prompt"] |= c.A_BOLD
+            attrs["h"] |= c.A_BOLD
+            attrs["link"] |= c.A_UNDERLINE
+        self.attrs = attrs
+        # 不同終端機送的按鍵序列不一樣（ESC [ B 或 ESC O B），ncurses 不一定都認得
+        self.esc_map = {
+            "[A": c.KEY_UP, "OA": c.KEY_UP, "[B": c.KEY_DOWN, "OB": c.KEY_DOWN,
+            "[1;2A": "p_up", "[1;2B": "p_down",
+            "[5~": "p_pgup", "[6~": "p_pgdn",
+            "[H": c.KEY_HOME, "OH": c.KEY_HOME, "[1~": c.KEY_HOME,
+            "[F": c.KEY_END, "OF": c.KEY_END, "[4~": c.KEY_END,
+        }
+
+    def read_escape(self):
+        """ESC 之後緊接著的字元；單按 Esc 時回傳空字串。"""
+        self.scr.timeout(30)
+        seq = ""
+        try:
+            while len(seq) < 24:
+                ch = self.scr.get_wch()
+                if not isinstance(ch, str):
+                    break
+                seq += ch
+                if len(seq) >= 2 and (ch.isalpha() or ch == "~"):
+                    break
+        except self.c.error:
+            pass
+        return seq
+
+    def apply_filter(self):
+        words = self.query.lower().split()
+        self.items = [s for s in self.sessions if all(w in s["_hay"] for w in words)]
+        self.sel = self.top = 0
+
+    def current(self):
+        return self.items[self.sel] if self.items else None
+
+    def move(self, delta):
+        self.sel = max(0, min(len(self.items) - 1, self.sel + delta)) if self.items else 0
+
+    def scroll_preview(self, delta):
+        if self.pscroll is not None:
+            self.pscroll = max(0, self.pscroll + delta)   # 上限在 draw 時夾住
+
+    def put(self, y, x, text, style=None, extra=0, maxw=None):
+        """安全地寫一段字，回傳實際佔用的寬度。"""
+        h, w = self.scr.getmaxyx()
+        if y < 0 or y >= h or x < 0 or x >= w:
+            return 0
+        avail = w - x if maxw is None else min(maxw, w - x)
+        if y == h - 1 and x + avail >= w:
+            avail = w - x - 1    # 右下角那格寫入會出錯
+        if avail <= 0:
+            return 0
+        t = cut(text, avail)
+        try:
+            self.scr.addstr(y, x, t, self.attrs.get(style, 0) | extra)
+        except self.c.error:
+            pass
+        return text_width(t)
+
+    def put_line(self, y, x, segs, right):
+        for text, style in segs:
+            x += self.put(y, x, text, style, maxw=right - x)
+
+    def draw(self):
+        c, scr = self.c, self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        if h < 8 or w < 40:
+            self.put(0, 0, "視窗太小了，請拉大一點")
+            scr.refresh()
+            return
+
+        count = "%d/%d" % (len(self.items), len(self.sessions))
+        self.put(0, 0, "❯ ", "prompt")
+        qx = 2 + self.put(0, 2, self.query, maxw=w - len(count) - 4)
+        self.put(0, w - len(count) - 1, count, "dim")
+        self.put(1, 0, self.HELP, "dim")
+
+        body_y, body_h = 2, h - 2
+        if w >= 110:   # 寬螢幕：左列表、右預覽
+            lw = max(50, int(w * 0.45))
+            lh = body_h
+            for y in range(body_y, h):
+                self.put(y, lw, "│", "dim")
+            px, py, pw, ph = lw + 2, body_y, w - lw - 2, body_h
+        else:          # 窄螢幕：上列表、下預覽
+            lw = w
+            lh = max(3, body_h * 2 // 5)
+            self.put(body_y + lh, 0, "─" * w, "dim")
+            px, py, pw, ph = 0, body_y + lh + 1, w, body_h - lh - 1
+        self.list_rect = (body_y, 0, lh, lw)
+        self.prev_rect = (py, px, ph, pw)
+
+        if self.sel < self.top:
+            self.top = self.sel
+        elif self.sel >= self.top + lh:
+            self.top = self.sel - lh + 1
+        for i in range(lh):
+            idx = self.top + i
+            if idx >= len(self.items):
+                break
+            extra = c.A_REVERSE if idx == self.sel else 0
+            if extra:
+                self.put(body_y + i, 0, " " * (lw - 1), None, extra)
+            x = 1
+            for text, style in row_segments(self.items[idx], lw - 2):
+                x += self.put(body_y + i, x, text, style, extra, maxw=lw - 1 - x)
+        if not self.items:
+            self.put(body_y, 1, "找不到符合的 session", "dim")
+
+        cur = self.current()
+        if cur:
+            if cur["path"] != self.pscroll_path:       # 換了 session，預覽回到預設位置
+                self.pscroll, self.pscroll_path = None, cur["path"]
+            d = self.previews.get(cur["path"])
+            if d is None:
+                self.put(py, px, "載入中…", "dim")
+            else:
+                self.draw_preview(cur["path"], d, py, px, ph, pw)
+
+        try:
+            scr.move(0, min(qx, w - 1))
+        except c.error:
+            pass
+        scr.refresh()
+
+    def draw_preview(self, path, d, py, px, ph, pw):
+        key = (path, pw)
+        if key not in self.views:
+            self.views[key] = preview_view(d, pw - 1)
+        head, body, starts = self.views[key]
+        right = px + pw - 1
+
+        head = head[:max(1, ph - 2)]
+        for i, segs in enumerate(head):
+            self.put_line(py + i, px, segs, right)
+        top = py + len(head)
+        avail = ph - len(head)
+        scrollable = len(body) > avail
+        bh = max(1, avail - 1 if scrollable else avail)   # 能捲動時最後一行留給位置提示
+        self.pbody_h = bh
+        max_scroll = max(0, len(body) - bh)
+        if self.pscroll is None:
+            n = len(starts)
+            self.pscroll = starts[n - TURNS_SHOWN] if n > TURNS_SHOWN else 0
+        self.pscroll = min(self.pscroll, max_scroll)
+
+        for i, segs in enumerate(body[self.pscroll:self.pscroll + bh]):
+            self.put_line(top + i, px, segs, right)
+
+        if scrollable and starts:
+            first = max(0, bisect.bisect_right(starts, self.pscroll) - 1)
+            last = max(0, bisect.bisect_right(starts, self.pscroll + bh - 1) - 1)
+            arrows = ("▲" if self.pscroll > 0 else " ") + ("▼" if self.pscroll < max_scroll else " ")
+            where = "第 %d 輪" % (first + 1) if first == last else "第 %d–%d 輪" % (first + 1, last + 1)
+            self.put(top + bh, px, "%s %s，共 %d 輪 · Shift↑↓／滾輪 捲動 · PgUp/PgDn 翻頁"
+                     % (arrows, where, len(starts)), "dim", maxw=pw - 1)
+
+    def load_preview(self, s):
+        try:
+            self.previews[s["path"]] = preview_data(s["path"])
+        except OSError:
+            self.previews[s["path"]] = {"when": "", "cwd": s["cwd"], "exists": s["exists"],
+                                        "name": "（讀取失敗）", "turns": []}
+
+    def handle_mouse(self, seq):
+        m = re.fullmatch(r"\[<(\d+);(\d+);(\d+)([Mm])", seq)
+        if not m:
+            return
+        button = int(m.group(1)) & ~(4 | 8 | 16)     # 去掉 Shift / Alt / Ctrl 修飾位元
+        x, y = int(m.group(2)) - 1, int(m.group(3)) - 1
+        py, px, ph, pw = self.prev_rect
+        in_preview = py <= y < py + ph and px <= x < px + pw
+        if button in (64, 65):                       # 滾輪：64 往上、65 往下
+            step = -1 if button == 64 else 1
+            if in_preview:
+                self.scroll_preview(step * SCROLL_STEP)
+            else:
+                self.move(step)
+        elif button == 0 and m.group(4) == "M":      # 左鍵按下：點列表選 session
+            ly, lx, lh, lw = self.list_rect
+            if ly <= y < ly + lh and lx <= x < lx + lw and self.top + (y - ly) < len(self.items):
+                self.sel = self.top + (y - ly)
+
+    def handle(self, ch):
+        c = self.c
+        if ch == "\x1b":
+            seq = self.read_escape()
+            if not seq:
+                return self.QUIT
+            if seq.startswith("[<"):
+                self.handle_mouse(seq)
+                return None
+            ch = self.esc_map.get(seq)
+            if ch is None:
+                return None      # 不認得的按鍵（例如 ← →）就忽略
+        n = len(self.items)
+        page = max(1, self.pbody_h - 2)
+        if ch in (c.KEY_UP, "\x10"):
+            self.move(-1)
+        elif ch in (c.KEY_DOWN, "\x0e"):
+            self.move(1)
+        elif ch in ("p_up", c.KEY_SR):
+            self.scroll_preview(-SCROLL_STEP)
+        elif ch in ("p_down", c.KEY_SF):
+            self.scroll_preview(SCROLL_STEP)
+        elif ch in ("p_pgup", c.KEY_PPAGE, "\x02"):
+            self.scroll_preview(-page)
+        elif ch in ("p_pgdn", c.KEY_NPAGE, "\x06"):
+            self.scroll_preview(page)
+        elif ch == c.KEY_HOME:
+            self.sel = 0
+        elif ch == c.KEY_END:
+            self.sel = max(n - 1, 0)
+        elif ch in ("\n", "\r", c.KEY_ENTER):
+            if n:
+                return (self.items[self.sel], False)
+        elif ch == "\x0f":
+            if n:
+                return (self.items[self.sel], True)
+        elif ch in ("\x03", "\x04", "\x07"):
+            return self.QUIT
+        elif ch == "\x0c":       # Ctrl-L：整個畫面重畫
+            self.scr.clear()
+        elif ch in (c.KEY_BACKSPACE, "\x7f", "\x08"):
+            if self.query:
+                self.query = self.query[:-1]
+                self.apply_filter()
+        elif ch == "\x15":
+            self.query = ""
+            self.apply_filter()
+        elif ch == "\x17":
+            self.query = re.sub(r"\S*\s*$", "", self.query)
+            self.apply_filter()
+        elif isinstance(ch, str) and ch.isprintable():
+            self.query += ch
+            self.apply_filter()
+        return None
+
+    def run(self):
+        dirty = True
+        while True:
+            cur = self.current()
+            need_preview = cur is not None and cur["path"] not in self.previews
+            # 預覽等按鍵停下來 60ms 才載入，按住方向鍵時不會卡
+            self.scr.timeout(60 if need_preview else -1)
+            if dirty:
+                self.draw()
+                dirty = False
+            try:
+                ch = self.scr.get_wch()
+            except self.c.error:
+                ch = None
+            if ch is None:
+                if need_preview:
+                    self.load_preview(cur)
+                    dirty = True
+                continue
+            dirty = True
+            result = self.handle(ch)
+            if result is self.QUIT:
+                return None
+            if result is not None:
+                return result
+
+
+def run_tui(sessions, query):
+    """在 /dev/tty 上跑 TUI，這樣 stdout 被導向（例如 $(ccs --print)）也能用。"""
+    import curses
+    os.environ.setdefault("ESCDELAY", "25")
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
+    if "utf" not in (locale.getpreferredencoding(False) or "").lower():
+        for name in ("UTF-8", "en_US.UTF-8", "C.UTF-8"):
+            try:
+                locale.setlocale(locale.LC_CTYPE, name)
+                break
+            except locale.Error:
+                pass
+
+    tty = os.open("/dev/tty", os.O_RDWR)
+    saved = []
+    try:
+        for fd in (0, 1):
+            if not os.isatty(fd):
+                saved.append((fd, os.dup(fd)))
+                os.dup2(tty, fd)
+        return curses.wrapper(lambda scr: TUI(scr, sessions, query).run())
+    finally:
+        try:
+            os.write(tty, TUI.MOUSE_OFF.encode())      # 不管怎麼離開都要關掉滑鼠回報
+        except OSError:
+            pass
+        for fd, dup in saved:
+            os.dup2(dup, fd)
+            os.close(dup)
+        os.close(tty)
+
+
+# ---------- 動作 ----------
+
+def copy_to_clipboard(text):
+    try:
+        subprocess.run(["pbcopy"], input=text.encode(), check=True)
+        return True
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
+def act(s, open_now):
+    cmd = resume_cmd(s)
+    exists = os.path.isdir(s["cwd"])
+    if open_now:
+        if not exists:
+            print("%s✗ 目錄已不存在，無法直接開啟：%s%s" % (ANSI["missing"], s["cwd"], RESET), file=sys.stderr)
+            return 1
+        print("%s→ %s%s" % (ANSI["dim"], cmd, RESET), file=sys.stderr)
+        os.chdir(s["cwd"])
+        os.execvp("claude", ["claude", "-r", s["id"]])
+    if copy_to_clipboard(cmd):
+        print("%s✓ 已複製%s  %s" % (ANSI["ok"], RESET, cmd))
+    else:
+        print(cmd)
+    if not exists:
+        print("%s⚠ 這個 session 的目錄已不存在，resume 前要先把目錄建回來（例如重開 worktree）%s"
+              % (ANSI["warn"], RESET))
+    return 0
+
+
+def main(argv):
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    if argv[:1] == ["--preview"] and len(argv) == 2:   # 除錯用：印出某個 session 檔的預覽
+        width = shutil.get_terminal_size((100, 40)).columns
+        head, body, _ = preview_view(preview_data(argv[1]), width)
+        for segs in head + body:
+            print(ansi_line(segs))
+        return 0
+    print_only = argv[:1] == ["--print"]
+    if print_only:
+        argv = argv[1:]
+
+    sessions = load_sessions()
+    if not sessions:
+        print("在 %s 找不到任何 session" % PROJECTS_DIR, file=sys.stderr)
+        return 1
+    query = " ".join(argv)
+
+    if not print_only and not sys.stdout.isatty():
+        words = query.lower().split()
+        for s in sessions:
+            if all(w in s["_hay"] for w in words):
+                print(plain_row(s))
+        return 0
+
+    try:
+        picked = run_tui(sessions, query)
+    except (ImportError, OSError) as e:
+        print("無法開啟 TUI（%s），改用 `ccs | less` 看純文字列表" % e, file=sys.stderr)
+        return 1
+    if not picked:
+        return 130
+    s, open_now = picked
+    if print_only:
+        print(resume_cmd(s))
+        return 0
+    return act(s, open_now)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        pass
